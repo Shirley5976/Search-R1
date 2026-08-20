@@ -17,8 +17,10 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import random
 import warnings
 
+import numpy as np
 import torch
 import torch.distributed
 import verl.utils.hdfs_io as hdfs_io
@@ -42,6 +44,57 @@ from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+
+def _save_rank_training_state(local_path, rank, optimizer, lr_scheduler):
+    os.makedirs(local_path, exist_ok=True)
+    state_path = os.path.join(local_path, f'training_state_rank_{rank}.pt')
+    temporary_state_path = f'{state_path}.tmp'
+    state = {
+        'optimizer': optimizer.state_dict(),
+        'lr_scheduler': lr_scheduler.state_dict(),
+        'python_rng_state': random.getstate(),
+        'numpy_rng_state': np.random.get_state(),
+        'torch_rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state(torch.cuda.current_device()),
+    }
+    torch.save(state, temporary_state_path)
+    os.replace(temporary_state_path, state_path)
+
+
+def _advance_lr_scheduler(lr_scheduler, global_step):
+    # Legacy Search-R1 checkpoints only contain model weights. Keep their LR schedule
+    # aligned with the inferred global step even though optimizer moments are unavailable.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        for _ in range(global_step):
+            lr_scheduler.step()
+
+
+def _load_rank_training_state(local_path, rank, optimizer, lr_scheduler, global_step):
+    state_files = [
+        filename for filename in os.listdir(local_path)
+        if filename.startswith('training_state_rank_') and filename.endswith('.pt')
+    ]
+    if not state_files:
+        _advance_lr_scheduler(lr_scheduler, global_step)
+        return False
+
+    state_path = os.path.join(local_path, f'training_state_rank_{rank}.pt')
+    if not os.path.isfile(state_path):
+        raise FileNotFoundError(
+            f'Incomplete distributed checkpoint: missing {state_path}. '
+            'Resume requires the same FSDP world size used when saving.'
+        )
+
+    state = torch.load(state_path, map_location='cpu', weights_only=False)
+    optimizer.load_state_dict(state['optimizer'])
+    lr_scheduler.load_state_dict(state['lr_scheduler'])
+    random.setstate(state['python_rng_state'])
+    np.random.set_state(state['numpy_rng_state'])
+    torch.set_rng_state(state['torch_rng_state'])
+    torch.cuda.set_rng_state(state['cuda_rng_state'], torch.cuda.current_device())
+    return True
 
 
 class ActorRolloutRefWorker(Worker):
@@ -301,7 +354,7 @@ class ActorRolloutRefWorker(Worker):
                 optim_config = None
                 fsdp_config = OmegaConf.create()
             self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler, self.actor_model_config = self._build_model_optimizer(
-                model_path=self.config.model.path,
+                model_path=self.config.model.get('resume_path', self.config.model.path),
                 fsdp_config=fsdp_config,
                 optim_config=optim_config,
                 override_model_config=override_model_config,
@@ -531,8 +584,22 @@ class ActorRolloutRefWorker(Worker):
                 hdfs_io.copy(src=local_path, dst=hdfs_path)
 
         torch.distributed.barrier()
+        _save_rank_training_state(local_path, self.rank, self.actor_optimizer, self.actor_lr_scheduler)
+        torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, checkpoint_path, global_step):
+        """Restore actor optimizer, scheduler, and RNG after model initialization."""
+        assert self._is_actor
+        return _load_rank_training_state(
+            checkpoint_path,
+            self.rank,
+            self.actor_optimizer,
+            self.actor_lr_scheduler,
+            global_step,
+        )
 
 
 class CriticWorker(Worker):

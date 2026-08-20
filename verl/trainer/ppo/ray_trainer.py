@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -43,6 +44,77 @@ import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
+
+
+def _checkpoint_step(checkpoint_path):
+    match = re.fullmatch(r'global_step_(\d+)', os.path.basename(os.path.normpath(checkpoint_path)))
+    return int(match.group(1)) if match else None
+
+
+def _has_complete_hf_weights(checkpoint_path):
+    """Return whether a local directory contains a complete HF model checkpoint."""
+    if not os.path.isfile(os.path.join(checkpoint_path, 'config.json')):
+        return False
+
+    for index_name in ('model.safetensors.index.json', 'pytorch_model.bin.index.json'):
+        index_path = os.path.join(checkpoint_path, index_name)
+        if os.path.isfile(index_path):
+            try:
+                with open(index_path, 'r', encoding='utf-8') as index_file:
+                    weight_map = json.load(index_file).get('weight_map', {})
+            except (OSError, ValueError):
+                return False
+            shard_names = set(weight_map.values())
+            return bool(shard_names) and all(
+                os.path.isfile(os.path.join(checkpoint_path, shard_name)) for shard_name in shard_names
+            )
+
+    return any(
+        os.path.isfile(os.path.join(checkpoint_path, filename))
+        for filename in ('model.safetensors', 'pytorch_model.bin')
+    )
+
+
+def _latest_checkpoint_under(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if _checkpoint_step(path) is not None and _has_complete_hf_weights(path):
+        return path
+
+    actor_dir = os.path.join(path, 'actor')
+    search_dir = actor_dir if os.path.isdir(actor_dir) else path
+    candidates = []
+    if os.path.isdir(search_dir):
+        for entry in os.scandir(search_dir):
+            if not entry.is_dir():
+                continue
+            step = _checkpoint_step(entry.path)
+            if step is not None and _has_complete_hf_weights(entry.path):
+                candidates.append((step, entry.path))
+    return max(candidates, default=(None, None), key=lambda item: item[0])[1]
+
+
+def resolve_resume_checkpoint(config):
+    """Resolve trainer.resume_* settings to an actor checkpoint directory."""
+    resume_mode = str(config.trainer.get('resume_mode', 'disable')).lower()
+    resume_from_path = config.trainer.get('resume_from_path', None)
+    if resume_mode == 'disable':
+        return None
+    if resume_mode not in ('auto', 'from_path'):
+        raise ValueError(f'Unsupported trainer.resume_mode={resume_mode!r}; use disable, auto, or from_path')
+
+    if resume_from_path:
+        checkpoint_path = _latest_checkpoint_under(str(resume_from_path))
+        if checkpoint_path is None:
+            raise FileNotFoundError(f'No valid checkpoint found under {resume_from_path}')
+        return checkpoint_path
+
+    if resume_mode == 'from_path':
+        raise ValueError('trainer.resume_mode=from_path requires trainer.resume_from_path')
+
+    checkpoint_path = _latest_checkpoint_under(str(config.trainer.default_local_dir))
+    if checkpoint_path is None:
+        print(f'No checkpoint found under {config.trainer.default_local_dir}; starting a new run')
+    return checkpoint_path
 
 
 class Role(Enum):
@@ -387,11 +459,14 @@ class RayPPOTrainer(object):
                 self.train_dataset.dataframe = self.train_dataset.dataframe.sample(self.config.data.train_data_num, random_state=42)
         print(f"filtered training dataset size: {len(self.train_dataset.dataframe)}")
 
+        self.train_data_seed = self.config.data.get('seed', 42)
+        self.train_dataloader_generator = torch.Generator()
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
                                            shuffle=self.config.data.shuffle_train_dataloader,
                                            drop_last=True,
-                                           collate_fn=collate_fn)
+                                           collate_fn=collate_fn,
+                                           generator=self.train_dataloader_generator)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -620,7 +695,7 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, epoch, batch_idx):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
@@ -633,6 +708,94 @@ class RayPPOTrainer(object):
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
+
+        next_epoch = epoch
+        next_batch_idx = batch_idx + 1
+        if next_batch_idx >= len(self.train_dataloader):
+            next_epoch += 1
+            next_batch_idx = 0
+        trainer_state = {
+            'global_step': self.global_steps,
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'next_epoch': next_epoch,
+            'next_batch_idx': next_batch_idx,
+            'train_dataloader_len': len(self.train_dataloader),
+            'world_size': self.actor_rollout_wg.world_size,
+        }
+        state_path = os.path.join(actor_local_path, 'trainer_state.json')
+        temporary_state_path = f'{state_path}.tmp'
+        with open(temporary_state_path, 'w', encoding='utf-8') as state_file:
+            json.dump(trainer_state, state_file, indent=2)
+        os.replace(temporary_state_path, state_path)
+
+        marker_path = os.path.join(actor_local_path, '.checkpoint_complete')
+        temporary_marker_path = f'{marker_path}.tmp'
+        with open(temporary_marker_path, 'w', encoding='utf-8') as marker_file:
+            marker_file.write(f'{self.global_steps}\n')
+        os.replace(temporary_marker_path, marker_path)
+
+    def _load_checkpoint(self):
+        checkpoint_path = self.config.trainer.get('resume_from_path', None)
+        if not checkpoint_path:
+            return None
+        checkpoint_path = os.path.abspath(os.path.expanduser(str(checkpoint_path)))
+        global_step = _checkpoint_step(checkpoint_path)
+        if global_step is None:
+            raise ValueError(f'Cannot infer global step from checkpoint path: {checkpoint_path}')
+
+        state_path = os.path.join(checkpoint_path, 'trainer_state.json')
+        trainer_state = {}
+        if os.path.isfile(state_path):
+            with open(state_path, 'r', encoding='utf-8') as state_file:
+                trainer_state = json.load(state_file)
+            global_step = int(trainer_state.get('global_step', global_step))
+
+        saved_world_size = trainer_state.get('world_size')
+        rank_state_files = [
+            filename for filename in os.listdir(checkpoint_path)
+            if re.fullmatch(r'training_state_rank_\d+\.pt', filename)
+        ]
+        if rank_state_files and saved_world_size is not None and saved_world_size != self.actor_rollout_wg.world_size:
+            raise ValueError(
+                'Optimizer checkpoint was saved with world_size='
+                f'{saved_world_size}, but the current run uses world_size={self.actor_rollout_wg.world_size}. '
+                'Resume with the same number of FSDP workers or remove the rank training-state files for weight-only restart.'
+            )
+
+        if self.config.actor_rollout_ref.actor.strategy != 'fsdp':
+            raise NotImplementedError('Checkpoint resume is currently implemented for the FSDP strategy')
+        restored_actor_states = self.actor_rollout_wg.load_checkpoint(checkpoint_path, global_step)
+        if not all(restored_actor_states):
+            warnings.warn(
+                f'{checkpoint_path} is a legacy model-only checkpoint. Actor weights and global step were restored, '
+                'but optimizer/RNG state was unavailable; the LR scheduler was advanced to the resumed step.',
+                RuntimeWarning,
+            )
+
+        if self.use_critic:
+            critic_path = os.path.join(
+                os.path.dirname(os.path.dirname(checkpoint_path)), 'critic', os.path.basename(checkpoint_path)
+            )
+            if not _has_complete_hf_weights(critic_path):
+                raise FileNotFoundError(f'Critic checkpoint is missing for PPO resume: {critic_path}')
+            restored_critic_states = self.critic_wg.load_checkpoint(critic_path, global_step)
+            if not all(restored_critic_states):
+                warnings.warn(
+                    f'{critic_path} has no optimizer/RNG state; critic resumed from weights only.',
+                    RuntimeWarning,
+                )
+
+        if 'next_epoch' not in trainer_state or 'next_batch_idx' not in trainer_state:
+            trainer_state['next_epoch'], trainer_state['next_batch_idx'] = divmod(
+                global_step, len(self.train_dataloader)
+            )
+        trainer_state['global_step'] = global_step
+        print(
+            f'Resumed from {checkpoint_path}: completed global_step={global_step}, '
+            f'next epoch={trainer_state["next_epoch"]}, next batch={trainer_state["next_batch_idx"]}'
+        )
+        return trainer_state
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -659,18 +822,26 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
-        self.global_steps = 0
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
+        resume_state = self._load_checkpoint()
+        start_epoch = 0
+        start_batch_idx = 0
+        if resume_state is not None:
+            self.global_steps = resume_state['global_step'] + 1
+            start_epoch = resume_state['next_epoch']
+            start_batch_idx = resume_state['next_batch_idx']
+        else:
+            self.global_steps = 0
+            # perform validation before training
+            # currently, we only support validation using the reward_function.
+            if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+                val_metrics = self._validate()
+                pprint(f'Initial validation metrics: {val_metrics}')
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get('val_only', False):
+                    return
 
-        # we start from step 1
-        self.global_steps += 1
+            # we start from step 1
+            self.global_steps += 1
 
         # Agent config preparation
         gen_config = GenerationConfig(
@@ -692,8 +863,12 @@ class RayPPOTrainer(object):
         )
 
         # start training loop
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            # Recreate the shuffled epoch order before skipping already completed batches.
+            self.train_dataloader_generator.manual_seed(self.train_data_seed + epoch)
+            for batch_idx, batch_dict in enumerate(self.train_dataloader):
+                if epoch == start_epoch and batch_idx < start_batch_idx:
+                    continue
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
@@ -831,7 +1006,7 @@ class RayPPOTrainer(object):
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+                            self._save_checkpoint(epoch, batch_idx)
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

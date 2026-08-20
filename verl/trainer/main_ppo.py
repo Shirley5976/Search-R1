@@ -117,7 +117,15 @@ def main_task(config):
 
     # print initial config
     from pprint import pprint
-    from omegaconf import OmegaConf
+    from omegaconf import OmegaConf, open_dict
+    from verl.trainer.ppo.ray_trainer import resolve_resume_checkpoint
+
+    resume_checkpoint = resolve_resume_checkpoint(config)
+    if resume_checkpoint is not None:
+        with open_dict(config):
+            config.actor_rollout_ref.model.resume_path = resume_checkpoint
+            config.trainer.resume_from_path = resume_checkpoint
+
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 
