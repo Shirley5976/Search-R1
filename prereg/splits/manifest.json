@@ -1,0 +1,66 @@
+{
+  "seed": 0,
+  "numpy_version": "1.26.4",
+  "pandas_version": "2.3.3",
+  "sources": {
+    "data/nq_hotpotqa_train/train.parquet": "c3cc21e862a8469105de666101578cbff23cdc77e91a803cef102622c89cc4f6",
+    "data/nq_hotpotqa_train/test.parquet": "30aa887b6d47e06e8c0f6f5307c88fe4e13461ac25a20ec0a5433ad7a4fe25dc"
+  },
+  "id_format": "data_source/id",
+  "counts": {
+    "pilot_calib": 200,
+    "pilot_eval": 300,
+    "val": 1000,
+    "curve_eval": 3125,
+    "train_pool": 168115
+  },
+  "counts_by_source": {
+    "pilot_calib": {
+      "hotpotqa": 100,
+      "nq": 100
+    },
+    "pilot_eval": {
+      "hotpotqa": 150,
+      "nq": 150
+    },
+    "val": {
+      "hotpotqa": 500,
+      "nq": 500
+    },
+    "curve_eval": {
+      "2wikimultihopqa": 500,
+      "bamboogle": 125,
+      "hotpotqa": 500,
+      "musique": 500,
+      "nq": 500,
+      "popqa": 500,
+      "triviaqa": 500
+    },
+    "train_pool": {
+      "hotpotqa": 89697,
+      "nq": 78418
+    }
+  },
+  "parquet": {
+    "pilot_calib": {
+      "parquet": "data/prereg/pilot_calib.parquet",
+      "sha256": "81145c7c74f70f5598bf857813dccd109227689d53f7b0200208b4c23d558c51"
+    },
+    "pilot_eval": {
+      "parquet": "data/prereg/pilot_eval.parquet",
+      "sha256": "6865b6464f1d8070692181d0c3b1a6acb263988341dcf70ed65a12ec16441957"
+    },
+    "val": {
+      "parquet": "data/prereg/val.parquet",
+      "sha256": "0ee02d043356ada55c4d165e4177927c0fc28fc4cf1dfbcf2110e8edc466f423"
+    },
+    "curve_eval": {
+      "parquet": "data/prereg/curve_eval.parquet",
+      "sha256": "2f80774686f3fc44f2d8d0d12dd40848329b388b2d19772e52423976497f3b07"
+    },
+    "train_pool": {
+      "parquet": "data/prereg/train_pool.parquet",
+      "sha256": "163e63e326aaf7d6c3969872f16b5830b5ba7051908a4f7a85e5f72c1c7129dd"
+    }
+  }
+}
