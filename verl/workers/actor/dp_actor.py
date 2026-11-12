@@ -200,7 +200,105 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def update_policy_single_step(self, data: DataProto):
+        """Plan B0c path: one optimizer.step() over the whole (expanded) batch.
+
+        Loss = [ sum_{original tokens} l + sum_{sibling tokens} w_sib * l ] / (N_orig_global * L_const),
+        where l = -advantage * ratio per token (ratio == 1 on-policy), w_sib defaults to 1 (set to
+        1/M on sibling samples by the P3 advantage builder via 'loss_weight'). Denominator is a fixed
+        constant so the estimator is unbiased; FSDP averages grads across ranks, so each rank scales
+        its local sum by world_size. KL and entropy act on original trajectories only.
+        """
+        self.actor_module.train()
+
+        # B0c assertions: exactly one optimizer step, no mid-accumulation zero_grad (enforced by
+        # construction below), on-policy full-support sampling, entropy off.
+        assert self.config.ppo_epochs == 1, 'single-step update requires ppo_epochs=1'
+        assert float(self.config.entropy_coeff) == 0.0, 'plan requires entropy_coeff=0'
+        temperature = data.meta_info['temperature']
+        assert abs(float(temperature) - 1.0) < 1e-8, 'plan requires temperature=1'
+        L_const = float(data.meta_info['loss_len_const'])
+        assert L_const > 0
+
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        if self.config.state_masking:
+            select_keys.append('loss_mask')
+        if self.config.use_kl_loss:
+            select_keys.append('ref_log_prob')
+        tb = data.batch
+        has_weight = 'loss_weight' in tb.keys()
+        has_isorig = 'is_original' in tb.keys()
+        if has_weight:
+            select_keys.append('loss_weight')
+        if has_isorig:
+            select_keys.append('is_original')
+        batch = data.select(batch_keys=select_keys).batch
+
+        # Global number of original trajectories, summed across ranks (robust to uneven sharding).
+        if has_isorig:
+            local_orig = batch['is_original'].sum()
+        else:
+            local_orig = torch.tensor(float(batch.batch_size[0]), device=torch.cuda.current_device())
+        local_orig = local_orig.to(torch.cuda.current_device()).float()
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            n_orig_global = local_orig.clone()
+            torch.distributed.all_reduce(n_orig_global, op=torch.distributed.ReduceOp.SUM)
+        else:
+            world_size = 1
+            n_orig_global = local_orig
+        denom = n_orig_global.clamp_min(1.0) * L_const
+
+        micro_batches = batch.split(self.config.ppo_micro_batch_size)
+        metrics = {}
+        self.actor_optimizer.zero_grad()
+        self._step_count = getattr(self, '_step_count', 0)
+
+        for data in micro_batches:
+            data = data.cuda()
+            responses = data['responses']
+            response_length = responses.size(1)
+            attention_mask = data['attention_mask']
+            response_mask = attention_mask[:, -response_length:]
+            if self.config.state_masking:
+                response_mask = data['loss_mask']
+            old_log_prob = data['old_log_probs']
+            advantages = data['advantages']
+            weight = data['loss_weight'].view(-1, 1) if has_weight else torch.ones_like(old_log_prob[:, :1])
+            is_orig = data['is_original'].view(-1, 1).float() if has_isorig else torch.ones_like(old_log_prob[:, :1])
+
+            _, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            ratio = torch.exp(log_prob - old_log_prob)
+            # token-level policy-gradient loss summed (not averaged) with fixed denominator
+            pg_tok = -advantages * ratio * response_mask * weight
+            pg_loss = pg_tok.sum() / denom * world_size
+
+            kl_loss_val = 0.0
+            if self.config.use_kl_loss:
+                ref_log_prob = data['ref_log_prob']
+                kld = core_algos.kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob,
+                                            kl_penalty=self.config.kl_loss_type)
+                # KL only on original trajectories
+                kl_mask = response_mask * is_orig
+                kl_tok = kld * kl_mask
+                kl_loss = kl_tok.sum() / denom * world_size
+                pg_loss = pg_loss + kl_loss * self.config.kl_loss_coef
+                kl_loss_val = kl_loss.detach().item()
+
+            pg_loss.backward()
+            append_to_dict(metrics, {'actor/pg_loss': pg_tok.sum().detach().item(),
+                                     'actor/kl_loss': kl_loss_val})
+
+        grad_norm = self._optimizer_step()
+        self._step_count += 1
+        append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item(),
+                                 'actor/opt_steps_this_call': 1,
+                                 'actor/n_orig_global': float(n_orig_global.item())})
+        return metrics
+
     def update_policy(self, data: DataProto):
+        if self.config.get('plan_single_step', False):
+            return self.update_policy_single_step(data)
         # make sure we are in training mode
         self.actor_module.train()
 

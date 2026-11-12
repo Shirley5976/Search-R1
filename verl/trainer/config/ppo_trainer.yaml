@@ -38,6 +38,8 @@ actor_rollout_ref:
     kl_loss_type: low_var_kl # for grpo
     ppo_epochs: 1
     shuffle: False
+    plan_single_step: False  # plan B0c: one optimizer.step() over the whole expanded batch
+    plan_loss_len: ${data.max_response_length}  # L constant in the fixed loss denominator N_orig*L
     ulysses_sequence_parallel_size: 1 # sp size
     optim:
       lr: 1e-6
@@ -173,6 +175,9 @@ trainer:
   save_freq: -1
   test_freq: -1
   critic_warmup: 0
+  eval_every_gpu_h: -1  # plan: eval val_files every X GPU hours of step time (-1 = off)
+  budget_gpu_h: null  # plan: stop when step-time GPU hours reach this budget
+  plan_eval_dir: null  # plan: if set, write per-question eval scores (jsonl) here
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 

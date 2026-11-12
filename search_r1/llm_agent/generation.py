@@ -9,6 +9,7 @@ from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
 import requests
+import time
 
 @dataclass
 class GenerationConfig:
@@ -443,7 +444,12 @@ If I want to give the final answer, I should put the answer between <answer> and
         Returns:
             search results which is concatenated into a string
         """
+        t0 = time.perf_counter()
         results = self._batch_search(queries)['result']
+        # plan: retrieval time per step, accumulated across turns (gen timing includes it)
+        timing_raw = getattr(self, 'timing_raw', None)
+        if timing_raw is not None:
+            timing_raw['search'] = timing_raw.get('search', 0.0) + time.perf_counter() - t0
         
         return [self._passages2string(result) for result in results]
 

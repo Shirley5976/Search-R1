@@ -42,6 +42,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from search_r1.plan.budget import GpuBudget
 
 WorkerType = Type[Worker]
 
@@ -485,7 +486,7 @@ class RayPPOTrainer(object):
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=self.config.data.val_batch_size,
                                          shuffle=False,
-                                         drop_last=True,
+                                         drop_last=False,  # plan: score every eval question
                                          collate_fn=collate_fn)
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
@@ -508,7 +509,7 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _validate(self):
+    def _validate(self, dump_tag=None):
         """
         The training loop of PPO with global metric computation.
         Accumulates metrics across all batches before computing final statistics.
@@ -516,6 +517,7 @@ class RayPPOTrainer(object):
         import torch
         reward_tensor_lst = []
         data_source_lst = []
+        qid_lst = []
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -569,6 +571,7 @@ class RayPPOTrainer(object):
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                qid_lst.append(test_batch.non_tensor_batch.get('id', [None] * reward_tensor.shape[0]))
         else:
             for batch_dict in self.val_dataloader:
                 timing_raw = {}
@@ -603,6 +606,7 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    qid_lst.append(test_batch.non_tensor_batch.get('id', [None] * reward_tensor.shape[0]))
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -618,6 +622,18 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        # plan: per-question scores for question-level bootstrap, ids follow prereg splits (data_source/id)
+        eval_dir = self.config.trainer.get('plan_eval_dir', None)
+        if eval_dir and dump_tag is not None:
+            qids = np.concatenate(qid_lst, axis=0)
+            os.makedirs(eval_dir, exist_ok=True)
+            out_path = os.path.join(eval_dir, f'eval_{dump_tag}_step{self.global_steps}.jsonl')
+            with open(out_path, 'w', encoding='utf-8') as f:
+                for i in range(reward_tensor.shape[0]):
+                    f.write(json.dumps({'qid': f'{data_sources[i]}/{qids[i]}',
+                                        'score': float(reward_tensor[i].item())}) + '\n')
+            metric_dict['val/n_questions'] = int(reward_tensor.shape[0])
 
         return metric_dict
 
@@ -723,6 +739,8 @@ class RayPPOTrainer(object):
             'train_dataloader_len': len(self.train_dataloader),
             'world_size': self.actor_rollout_wg.world_size,
         }
+        if getattr(self, 'plan_budget', None) is not None:
+            trainer_state['plan_budget'] = self.plan_budget.state_dict()
         state_path = os.path.join(actor_local_path, 'trainer_state.json')
         temporary_state_path = f'{state_path}.tmp'
         with open(temporary_state_path, 'w', encoding='utf-8') as state_file:
@@ -825,16 +843,22 @@ class RayPPOTrainer(object):
         resume_state = self._load_checkpoint()
         start_epoch = 0
         start_batch_idx = 0
+        self.plan_budget = budget = GpuBudget(
+            n_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+            eval_every_gpu_h=self.config.trainer.get('eval_every_gpu_h', -1),
+            budget_gpu_h=self.config.trainer.get('budget_gpu_h', None))
         if resume_state is not None:
             self.global_steps = resume_state['global_step'] + 1
             start_epoch = resume_state['next_epoch']
             start_batch_idx = resume_state['next_batch_idx']
+            if 'plan_budget' in resume_state:
+                budget.load_state_dict(resume_state['plan_budget'])
         else:
             self.global_steps = 0
             # perform validation before training
             # currently, we only support validation using the reward_function.
             if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-                val_metrics = self._validate()
+                val_metrics = self._validate(dump_tag='gpuh0.00')
                 pprint(f'Initial validation metrics: {val_metrics}')
                 logger.log(data=val_metrics, step=self.global_steps)
                 if self.config.trainer.get('val_only', False):
@@ -916,7 +940,11 @@ class RayPPOTrainer(object):
 
                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                         #                                         dtype=object)
-                        batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
+                        # index restarts at 0 in each data source, so group by data_source/index
+                        batch.non_tensor_batch['uid'] = np.array(
+                            [f'{src}/{idx}' for src, idx in zip(batch.non_tensor_batch['data_source'],
+                                                                batch.non_tensor_batch['index'])],
+                            dtype=object)
                                             
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -992,21 +1020,28 @@ class RayPPOTrainer(object):
                         with _timer('update_actor', timing_raw):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
+                            # plan single-step path: fixed loss denominator N_orig * L_const
+                            batch.meta_info['loss_len_const'] = float(
+                                self.config.actor_rollout_ref.actor.plan_loss_len)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        self.global_steps % self.config.trainer.test_freq == 0:
-                        with _timer('testing', timing_raw):
-                            val_metrics: dict = self._validate()
-                        metrics.update(val_metrics)
+                # plan budget: only the step counts; validation and checkpointing are timed outside it
+                budget.add_step(timing_raw['step'])
+                metrics['plan/budget_gpu_h'] = budget.used_gpu_h
 
-                    if self.config.trainer.save_freq > 0 and \
-                            self.global_steps % self.config.trainer.save_freq == 0:
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint(epoch, batch_idx)
+                # validate
+                if self.val_reward_fn is not None and (budget.eval_due() or (
+                        self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0)):
+                    with _timer('testing', timing_raw):
+                        val_metrics: dict = self._validate(dump_tag=f'gpuh{budget.used_gpu_h:.2f}')
+                    metrics.update(val_metrics)
+
+                if self.config.trainer.save_freq > 0 and \
+                        self.global_steps % self.config.trainer.save_freq == 0:
+                    with _timer('save_checkpoint', timing_raw):
+                        self._save_checkpoint(epoch, batch_idx)
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -1017,11 +1052,11 @@ class RayPPOTrainer(object):
 
                 self.global_steps += 1
 
-                if self.global_steps >= self.total_training_steps:
+                if self.global_steps >= self.total_training_steps or budget.exhausted():
 
                     # perform validation after training
                     if self.val_reward_fn is not None:
-                        val_metrics = self._validate()
+                        val_metrics = self._validate(dump_tag=f'final_gpuh{budget.used_gpu_h:.2f}')
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
