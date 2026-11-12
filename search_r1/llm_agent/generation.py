@@ -10,6 +10,7 @@ from verl.utils.tracking import Tracking
 import shutil
 import requests
 import time
+import numpy as np
 
 @dataclass
 class GenerationConfig:
@@ -22,6 +23,10 @@ class GenerationConfig:
     no_think_rl: bool=False
     search_url: str = None
     topk: int = 3
+    # plan (P3 fork): siblings per forked trajectory, k* ~ Uniform{1..plan_kstar_max}, RNG seed
+    plan_fork_m: int = 0
+    plan_kstar_max: int = 4
+    plan_seed: int = 0
 
 class LLMGenerationManager:
     def __init__(
@@ -42,6 +47,12 @@ class LLMGenerationManager:
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
+        # plan: k* is drawn before each rollout from its own RNG, independent of every sampled action
+        self.plan_rng = np.random.RandomState(config.plan_seed)
+        self.last_trace = None
+        self.last_k_star = None
+        self.last_siblings = None
+        self.last_sib_records = None
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -123,9 +134,13 @@ class LLMGenerationManager:
                 prompt_with_mask: torch.Tensor, 
                 response: torch.Tensor, 
                 info: torch.Tensor = None,
-                pad_to_left: bool = True
+                pad_to_left: bool = True,
+                prompt_turn: torch.Tensor = None,
+                turn_id: int = 0,
             ) -> torch.Tensor:
-        """Concatenate tensors and handle padding. Additionally, create a mask (info_mask) to cover the information block if it exists."""
+        """Concatenate tensors and handle padding. Additionally, create a mask (info_mask) to cover the information block if it exists.
+        plan: if prompt_turn is given, also carry a per-token decision-turn id (response tokens of this
+        call get turn_id, observation and padding get 0) through the same reordering."""
         pad_id = self.tokenizer.pad_token_id
         tensors = [prompt, response]
         tensors_with_mask = [prompt_with_mask, response]
@@ -133,7 +148,7 @@ class LLMGenerationManager:
             tensors.append(info)
             info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
             tensors_with_mask.append(info_mask)
-        
+
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
         mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
@@ -141,31 +156,38 @@ class LLMGenerationManager:
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
 
-        return padded_tensor, padded_tensor_with_info
+        if prompt_turn is None:
+            return padded_tensor, padded_tensor_with_info
+        turn_tensors = [prompt_turn, torch.where(response != pad_id, turn_id, 0).to(prompt_turn.dtype)]
+        if info is not None:
+            turn_tensors.append(torch.zeros_like(info, dtype=prompt_turn.dtype))
+        padded_turn = torch.cat(turn_tensors, dim=1).gather(1, sorted_indices)
+        return padded_tensor, padded_tensor_with_info, padded_turn
 
-    def _update_right_side(self, right_side: Dict, 
+    def _update_right_side(self, right_side: Dict,
                           cur_responses: torch.Tensor,
-                          next_obs_ids: torch.Tensor = None) -> Dict:
-        """Update right side state."""
-        if next_obs_ids != None:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
-                    right_side['responses'],
-                    right_side['responses_with_info_mask'],
-                    cur_responses,
-                    next_obs_ids, 
-                    pad_to_left=False
-                )
-        else:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
-                    right_side['responses'],
-                    right_side['responses_with_info_mask'],
-                    cur_responses,
-                    pad_to_left=False
-                )
+                          next_obs_ids: torch.Tensor = None,
+                          turn_id: int = 0) -> Dict:
+        """Update right side state. plan: right_side['turn_ids'] (if present) tracks decision turns."""
+        out = self._info_masked_concatenate_with_padding(
+                right_side['responses'],
+                right_side['responses_with_info_mask'],
+                cur_responses,
+                next_obs_ids,
+                pad_to_left=False,
+                prompt_turn=right_side.get('turn_ids'),
+                turn_id=turn_id,
+            )
+        responses, responses_with_info_mask = out[0], out[1]
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
-        
-        return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+        if effective_len > self.config.max_prompt_length:
+            self.plan_truncated = True
+
+        new_right = {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+        if len(out) == 3:
+            new_right['turn_ids'] = out[2][:, :max_len]
+        return new_right
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
@@ -219,15 +241,30 @@ class LLMGenerationManager:
         return padded_output
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
-        """Run main LLM generation loop."""
-        
+        """Run main LLM generation loop.
+
+        plan additions: a per-trajectory trace of decision turns (self.last_trace) and per-token turn
+        ids ('turn_ids'). In training with plan_fork_m = M > 0 (P3 / pilot), k* ~ Uniform{1..K} is
+        drawn per trajectory before the rollout (self.last_k_star); at turn k* the M siblings are
+        sampled in the same vLLM call and from the same prefix as the true action, their searches go
+        in the same retrieval batch, and they are never continued (self.last_siblings,
+        self.last_sib_records). Trajectories that end before k* are not forked.
+        """
+        bs = gen_batch.batch['input_ids'].shape[0]
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
-        
-        active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
-        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []],
+                               'turn_ids': initial_input_ids[:, []]}
+
+        fork_m = 0 if self.is_validation else int(self.config.plan_fork_m)
+        k_star = None if self.is_validation else self.plan_rng.randint(1, self.config.plan_kstar_max + 1, size=bs)
+        trace = [[] for _ in range(bs)]
+        sib_parts, sib_records = [], []
+        self.plan_truncated = False
+
+        active_mask = torch.ones(bs, dtype=torch.bool)
+        turns_stats = torch.ones(bs, dtype=torch.int)
+        valid_action_stats = torch.zeros(bs, dtype=torch.int)
+        valid_search_stats = torch.zeros(bs, dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -239,22 +276,9 @@ class LLMGenerationManager:
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
-            
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
-            gen_output = self._generate_with_gpu_padding(rollings_active)
+            responses_ids, next_obs, dones, valid_action, is_search, meta_info = self._plan_turn(
+                rollings, active_mask, step + 1, k_star, fork_m, original_right_side, trace, sib_parts, sib_records)
 
-            meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
-
-            # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask
-            )
-            
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
@@ -263,7 +287,7 @@ class LLMGenerationManager:
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
             next_obs_ids = self._process_next_obs(next_obs)
-            
+
             # Update states
             rollings = self._update_rolling_state(
                 rollings,
@@ -273,51 +297,104 @@ class LLMGenerationManager:
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
-                next_obs_ids
+                next_obs_ids,
+                turn_id=step + 1,
             )
-            
+
         # final LLM rollout
         if active_mask.sum():
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
-
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
-            rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })            
-            gen_output = self._generate_with_gpu_padding(rollings_active)
-
-            meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
-
-            # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=False
-            )
+            final_k = self.config.max_turns + 1
+            responses_ids, _, dones, valid_action, is_search, meta_info = self._plan_turn(
+                rollings, active_mask, final_k, k_star, fork_m, original_right_side, trace, sib_parts, sib_records,
+                do_search=False)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
-            
 
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
+                turn_id=final_k,
             )
-        
+
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
-        
+
         print("ACTIVE_TRAJ_NUM:", active_num_list)
-        
+
+        self.last_trace = trace
+        self.last_k_star = k_star
+        self.last_sib_records = sib_records
+        self.last_siblings = None
+        width = original_right_side['responses'].shape[1]
+        if sib_parts:
+            width = max(width, max(rs['responses'].shape[1] for _, rs in sib_parts))
+            parents = torch.cat([p for p, _ in sib_parts])
+            sib_right = {key: torch.cat([self._pad_right(rs[key], width, key) for _, rs in sib_parts])
+                         for key in original_right_side}
+            sib_left = {'input_ids': original_left_side['input_ids'][parents]}
+            self.last_siblings = self._compose_final_output(sib_left, sib_right, {})
+        original_right_side = {key: self._pad_right(v, width, key) for key, v in original_right_side.items()}
         return self._compose_final_output(original_left_side, original_right_side, meta_info)
+
+    def _pad_right(self, t: torch.Tensor, width: int, key: str) -> torch.Tensor:
+        if t.shape[1] == width:
+            return t
+        # turn_ids use 0 outside response tokens; token tensors use the pad id
+        value = 0 if key == 'turn_ids' else self.tokenizer.pad_token_id
+        pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
+        return torch.cat([t, pad], dim=1)
+
+    def _plan_turn(self, rollings, active_mask, k, k_star, fork_m, right_side, trace, sib_parts, sib_records,
+                   do_search=True):
+        """One decision turn for the active trajectories, plus the M siblings of every trajectory
+        whose k* equals k. Returns the original rows only; sibling state goes to sib_parts/records."""
+        bs = active_mask.shape[0]
+        active_idx = torch.nonzero(active_mask, as_tuple=False).view(-1).tolist()
+        fork_parents = [i for i in active_idx if fork_m > 0 and k_star is not None and k_star[i] == k]
+        sib_src = torch.tensor([p for p in fork_parents for _ in range(fork_m)], dtype=torch.long)
+        n_act = len(active_idx)
+
+        gen_in = {key: v[active_mask] for key, v in rollings.batch.items()}
+        if len(sib_src):
+            gen_in = {key: torch.cat([v, rollings.batch[key][sib_src]], dim=0) for key, v in gen_in.items()}
+        gen_output = self._generate_with_gpu_padding(DataProto.from_dict(gen_in))
+        meta_info = gen_output.meta_info
+
+        all_ids, all_str = self._postprocess_responses(gen_output.batch['responses'])
+        responses_ids, responses_str = self.tensor_fn._example_level_pad(all_ids[:n_act], all_str[:n_act], active_mask)
+        sib_ids, sib_str = all_ids[n_act:], all_str[n_act:]
+        n_sib = len(sib_str)
+
+        # Execute originals and siblings together: one retrieval batch per turn
+        exec_mask = torch.cat([active_mask, torch.ones(n_sib, dtype=torch.bool)])
+        next_obs, dones, valid_action, is_search = self.execute_predictions(
+            responses_str + sib_str, self.tokenizer.pad_token, exec_mask, do_search=do_search)
+        actions, contents = self.postprocess_predictions(responses_str + sib_str)
+        docs = self._last_docs
+
+        for i in active_idx:
+            trace[i].append({'k': k, 'action': actions[i], 'content': contents[i],
+                             'executed': bool(is_search[i]) and do_search, 'docs': docs[i] or []})
+        if n_sib:
+            rs = {key: v[sib_src] for key, v in right_side.items()}
+            rs = self._update_right_side(rs, sib_ids, None, turn_id=k)
+            sib_parts.append((sib_src, rs))
+            for s in range(n_sib):
+                g = bs + s
+                sib_records.append({'parent': int(sib_src[s]), 'j': s % fork_m + 1, 'k': k,
+                                    'action': actions[g], 'content': contents[g],
+                                    'executed': bool(is_search[g]) and do_search, 'docs': docs[g] or []})
+        return (responses_ids, next_obs[:bs], dones[:bs], valid_action[:bs], is_search[:bs], meta_info)
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
@@ -371,9 +448,13 @@ class LLMGenerationManager:
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
         if do_search:
             search_results = self.batch_search(search_queries)
+            search_docs = list(self._last_search_docs)
             assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
         else:
             search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+            search_docs = [[] for _ in search_results]
+        # plan: per-row list of retrieved passages (None if the row did not search), for the reader
+        self._last_docs = [None] * len(cur_actions)
 
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             
@@ -390,6 +471,7 @@ class LLMGenerationManager:
                     is_search.append(0)
                 elif action == 'search':
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    self._last_docs[i] = search_docs.pop(0)
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
@@ -445,12 +527,13 @@ If I want to give the final answer, I should put the answer between <answer> and
             search results which is concatenated into a string
         """
         t0 = time.perf_counter()
-        results = self._batch_search(queries)['result']
+        results = self._batch_search(queries)['result'] if queries else []
         # plan: retrieval time per step, accumulated across turns (gen timing includes it)
         timing_raw = getattr(self, 'timing_raw', None)
         if timing_raw is not None:
             timing_raw['search'] = timing_raw.get('search', 0.0) + time.perf_counter() - t0
         
+        self._last_search_docs = [self._passages2docs(result) for result in results]
         return [self._passages2string(result) for result in results]
 
     def _batch_search(self, queries):
@@ -473,3 +556,13 @@ If I want to give the final answer, I should put the answer between <answer> and
             format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
 
         return format_reference
+
+    def _passages2docs(self, retrieval_result):
+        """plan: the same passages as _passages2string, one string per document, for the reader."""
+        docs = []
+        for doc_item in retrieval_result:
+            content = doc_item['document']['contents']
+            title = content.split("\n")[0]
+            text = "\n".join(content.split("\n")[1:])
+            docs.append(f"(Title: {title}) {text}")
+        return docs
