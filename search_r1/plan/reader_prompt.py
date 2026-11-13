@@ -74,10 +74,14 @@ class ReaderPromptBuilder:
             pieces = pieces[1:]
         return [], 0
 
-    def build(self, question, docs, aliases):
-        """One row per alias: (input_ids, target_len). The target is the last target_len tokens."""
+    def build(self, question, docs, aliases, info=None):
+        """One row per alias: (input_ids, target_len). The target is the last target_len tokens.
+        If info is a dict it receives n_docs (after dedup) and n_kept (after truncation)."""
         pre, post = self._template(question)
-        block, _ = self.docs_block(docs)
+        block, kept = self.docs_block(docs)
+        if info is not None:
+            info['n_docs'] = len(dedup_docs(docs))
+            info['n_kept'] = kept
         ctx = self._ids(pre) + block + self._ids(post)
         rows = []
         for a in clean_aliases(aliases):

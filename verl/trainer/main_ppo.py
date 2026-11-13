@@ -188,6 +188,14 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
+    plan_cfg = config.get('plan', None)
+    if plan_cfg is not None and plan_cfg.get('enable', False):
+        from search_r1.plan.step import phi_needs
+        if phi_needs(plan_cfg.method, plan_cfg.get('mode', 'train')):
+            from search_r1.plan.reader_worker import ReaderWorker
+            role_worker_mapping[Role.Reader] = ray.remote(ReaderWorker)
+            mapping[Role.Reader] = global_pool_id
+
     reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
 
     # Note that we always use function-based RM for validation

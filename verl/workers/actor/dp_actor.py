@@ -142,6 +142,10 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        # plan B0b: lets a test capture the accumulated (unclipped) gradient right before clip/step
+        hook = getattr(self, 'pre_step_hook', None)
+        if hook is not None:
+            hook(self.actor_module)
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)

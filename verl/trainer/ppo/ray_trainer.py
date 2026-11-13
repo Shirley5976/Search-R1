@@ -43,6 +43,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 from search_r1.plan.budget import GpuBudget
+from search_r1.plan.trainer_plan import PlanTrainerMixin
 
 WorkerType = Type[Worker]
 
@@ -129,6 +130,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    Reader = 7  # plan: frozen reader (search_r1/plan/reader_worker.py)
 
 
 @dataclass
@@ -383,7 +385,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] = timer.last
 
 
-class RayPPOTrainer(object):
+class RayPPOTrainer(PlanTrainerMixin):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
@@ -434,6 +436,7 @@ class RayPPOTrainer(object):
 
         self._create_dataloader()
         self._init_logger()
+        self._plan_init()
     
     def _init_logger(self):
         from verl.utils.tracking import Tracking
@@ -461,6 +464,9 @@ class RayPPOTrainer(object):
         print(f"filtered training dataset size: {len(self.train_dataset.dataframe)}")
 
         self.train_data_seed = self.config.data.get('seed', 42)
+        if self.config.trainer.get('seed', None) is not None:
+            # plan: per-seed data order, disjoint from the warm-up order (data.seed)
+            self.train_data_seed = 10000 + int(self.config.trainer.seed)
         self.train_dataloader_generator = torch.Generator()
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
@@ -681,6 +687,12 @@ class RayPPOTrainer(object):
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
 
+        # plan: frozen reader, colocated with actor/rollout/ref
+        if self.plan_enabled and self.plan_use_reader:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Reader)
+            reader_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.Reader], config=self.config.plan.reader)
+            self.resource_pool_to_cls[resource_pool]['reader'] = reader_cls
+
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
@@ -706,6 +718,9 @@ class RayPPOTrainer(object):
         if self.use_rm:
             self.rm_wg = all_wg['rm']
             self.rm_wg.init_model()
+
+        # reader params go to CPU after init, so vLLM below still sees the free memory
+        self._plan_init_reader(all_wg)
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg['actor_rollout']
@@ -741,6 +756,7 @@ class RayPPOTrainer(object):
         }
         if getattr(self, 'plan_budget', None) is not None:
             trainer_state['plan_budget'] = self.plan_budget.state_dict()
+        trainer_state.update(self._plan_extra_state())
         state_path = os.path.join(actor_local_path, 'trainer_state.json')
         temporary_state_path = f'{state_path}.tmp'
         with open(temporary_state_path, 'w', encoding='utf-8') as state_file:
@@ -832,43 +848,8 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
-
-        logger = self.logger
-        resume_state = self._load_checkpoint()
-        start_epoch = 0
-        start_batch_idx = 0
-        self.plan_budget = budget = GpuBudget(
-            n_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
-            eval_every_gpu_h=self.config.trainer.get('eval_every_gpu_h', -1),
-            budget_gpu_h=self.config.trainer.get('budget_gpu_h', None))
-        if resume_state is not None:
-            self.global_steps = resume_state['global_step'] + 1
-            start_epoch = resume_state['next_epoch']
-            start_batch_idx = resume_state['next_batch_idx']
-            if 'plan_budget' in resume_state:
-                budget.load_state_dict(resume_state['plan_budget'])
-        else:
-            self.global_steps = 0
-            # perform validation before training
-            # currently, we only support validation using the reward_function.
-            if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-                val_metrics = self._validate(dump_tag='gpuh0.00')
-                pprint(f'Initial validation metrics: {val_metrics}')
-                logger.log(data=val_metrics, step=self.global_steps)
-                if self.config.trainer.get('val_only', False):
-                    return
-
-            # we start from step 1
-            self.global_steps += 1
-
-        # Agent config preparation
-        gen_config = GenerationConfig(
+    def _make_gen_config(self):
+        return GenerationConfig(
             max_turns=self.config.max_turns,
             max_start_length=self.config.data.max_start_length,
             max_prompt_length=self.config.data.max_prompt_length,
@@ -878,7 +859,66 @@ class RayPPOTrainer(object):
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
             topk = self.config.retriever.topk,
+            **self._plan_gen_kwargs(),
         )
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+
+        logger = self.logger
+        if self.plan_enabled and self.plan_mode == 'pilot':
+            self._plan_reseed_workers()
+            generation_manager = LLMGenerationManager(tokenizer=self.tokenizer, actor_rollout_wg=self.actor_rollout_wg,
+                                                      config=self._make_gen_config())
+            return self.fit_pilot(generation_manager)
+
+        resume_state = self._load_checkpoint()
+        start_epoch = 0
+        start_batch_idx = 0
+        self.plan_budget = budget = GpuBudget(
+            n_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+            eval_every_gpu_h=self.config.trainer.get('eval_every_gpu_h', -1),
+            budget_gpu_h=self.config.trainer.get('budget_gpu_h', None))
+        if self.config.trainer.get('val_only', False):
+            # plan: final full-test evaluation of a saved checkpoint (weights come from resume_path)
+            tag = self.config.trainer.get('val_only_tag', 'valonly')
+            val_metrics = self._validate(dump_tag=tag)
+            pprint(f'Validation-only metrics: {val_metrics}')
+            logger.log(data=val_metrics, step=resume_state['global_step'] if resume_state else 0)
+            return
+        if resume_state is not None:
+            self.global_steps = resume_state['global_step'] + 1
+            start_epoch = resume_state['next_epoch']
+            start_batch_idx = resume_state['next_batch_idx']
+            if 'plan_budget' in resume_state:
+                budget.load_state_dict(resume_state['plan_budget'])
+            self._plan_load_extra_state(resume_state)
+        else:
+            init_from = self.config.trainer.get('plan_init_path', None)
+            if init_from:
+                # plan: start from theta_w with its optimizer state; fresh step count, budget, data order
+                restored = self.actor_rollout_wg.load_checkpoint(init_from, 0)
+                assert all(restored), f'{init_from} has no optimizer state'
+                print(f'[plan] initialised actor and optimizer from {init_from}')
+            self._plan_reseed_workers()
+            self.global_steps = 0
+            # perform validation before training
+            # currently, we only support validation using the reward_function.
+            if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+                val_metrics = self._validate(dump_tag='gpuh0.00')
+                pprint(f'Initial validation metrics: {val_metrics}')
+                logger.log(data=val_metrics, step=self.global_steps)
+                self._plan_log_jsonl({**val_metrics, 'plan/budget_gpu_h': 0.0})
+
+            # we start from step 1
+            self.global_steps += 1
+
+        # Agent config preparation
+        gen_config = self._make_gen_config()
 
         generation_manager = LLMGenerationManager(
             tokenizer=self.tokenizer,
@@ -903,164 +943,178 @@ class RayPPOTrainer(object):
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
-                ####################
-                # original code here
+                if self.plan_enabled:
+                    with _timer('step', timing_raw):
+                        batch = self._plan_step(batch, gen_batch, generation_manager, metrics, timing_raw)
+                else:
+                  ####################
+                  # original code here
 
-                with _timer('step', timing_raw):
-                    if not self.config.do_search:
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                  with _timer('step', timing_raw):
+                      if not self.config.do_search:
+                          gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                                dtype=object)
-                        # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        batch = batch.union(gen_batch_output)
+                          batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                                  dtype=object)
+                          # repeat to align with repeated responses in rollout
+                          batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                          batch = batch.union(gen_batch_output)
 
-                ####################
-                # Below is aLL about agents - the "LLM + forloop"
-                ####################
-                # with _timer('step', timing_raw):
-                    else:
-                        first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
+                  ####################
+                  # Below is aLL about agents - the "LLM + forloop"
+                  ####################
+                  # with _timer('step', timing_raw):
+                      else:
+                          first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone().long()
 
-                        with _timer('gen', timing_raw):
-                            generation_manager.timing_raw = timing_raw
-                            final_gen_batch_output = generation_manager.run_llm_loop(
-                                gen_batch=gen_batch,
-                                initial_input_ids=first_input_ids,
-                            )
+                          with _timer('gen', timing_raw):
+                              generation_manager.timing_raw = timing_raw
+                              final_gen_batch_output = generation_manager.run_llm_loop(
+                                  gen_batch=gen_batch,
+                                  initial_input_ids=first_input_ids,
+                              )
 
-                        # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
-                        for key in final_gen_batch_output.batch.keys():
-                            final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
+                          # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
+                          for key in final_gen_batch_output.batch.keys():
+                              final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
-                        with torch.no_grad():
-                            output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
-                            final_gen_batch_output = final_gen_batch_output.union(output)
+                          with torch.no_grad():
+                              output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
+                              final_gen_batch_output = final_gen_batch_output.union(output)
 
-                        # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                        #                                         dtype=object)
-                        # index restarts at 0 in each data source, so group by data_source/index
-                        batch.non_tensor_batch['uid'] = np.array(
-                            [f'{src}/{idx}' for src, idx in zip(batch.non_tensor_batch['data_source'],
-                                                                batch.non_tensor_batch['index'])],
-                            dtype=object)
+                          # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                          #                                         dtype=object)
+                          # index restarts at 0 in each data source, so group by data_source/index
+                          batch.non_tensor_batch['uid'] = np.array(
+                              [f'{src}/{idx}' for src, idx in zip(batch.non_tensor_batch['data_source'],
+                                                                  batch.non_tensor_batch['index'])],
+                              dtype=object)
                                             
-                        # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        batch = batch.union(final_gen_batch_output)
+                          # repeat to align with repeated responses in rollout
+                          batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                          batch = batch.union(final_gen_batch_output)
 
-                    ####################
-                    ####################
+                      ####################
+                      ####################
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                      # balance the number of valid tokens on each dp rank.
+                      # Note that this breaks the order of data inside the batch.
+                      # Please take care when you implement group based adv computation such as GRPO and rloo
+                      self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                      # compute global_valid tokens
+                      batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
-                    # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
-                    for key in batch.batch.keys():
-                        if key != 'old_log_probs':
-                            batch.batch[key] = batch.batch[key].long()
+                      # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
+                      for key in batch.batch.keys():
+                          if key != 'old_log_probs':
+                              batch.batch[key] = batch.batch[key].long()
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                      if self.use_reference_policy:
+                          # compute reference log_prob
+                          with _timer('ref', timing_raw):
+                              ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                              batch = batch.union(ref_log_prob)
 
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                      # compute values
+                      if self.use_critic:
+                          with _timer('values', timing_raw):
+                              values = self.critic_wg.compute_values(batch)
+                              batch = batch.union(values)
 
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                      with _timer('adv', timing_raw):
+                          # compute scores. Support both model and function-based.
+                          # We first compute the scores using reward model. Then, we call reward_fn to combine
+                          # the results from reward model and rule-based results.
+                          if self.use_rm:
+                              # we first compute reward model score
+                              reward_tensor = self.rm_wg.compute_rm_score(batch)
+                              batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                          # we combine with rule-based rm
+                          reward_tensor = self.reward_fn(batch)
+                          batch.batch['token_level_scores'] = reward_tensor
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                          # compute rewards. apply_kl_penalty if available
+                          if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                              batch, kl_metrics = apply_kl_penalty(batch,
+                                                                   kl_ctrl=self.kl_ctrl,
+                                                                   kl_penalty=self.config.algorithm.kl_penalty)
+                              metrics.update(kl_metrics)
+                          else:
+                              batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                          # compute advantages, executed on the driver process
+                          batch = compute_advantage(batch,
+                                                    adv_estimator=self.config.algorithm.adv_estimator,
+                                                    gamma=self.config.algorithm.gamma,
+                                                    lam=self.config.algorithm.lam,
+                                                    num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
+                      # update critic
+                      if self.use_critic:
+                          with _timer('update_critic', timing_raw):
+                              critic_output = self.critic_wg.update_critic(batch)
+                          critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                          metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
-                                batch, metrics = self._create_loss_mask(batch, metrics)
-                            # plan single-step path: fixed loss denominator N_orig * L_const
-                            batch.meta_info['loss_len_const'] = float(
-                                self.config.actor_rollout_ref.actor.plan_loss_len)
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                      # implement critic warmup
+                      if self.config.trainer.critic_warmup <= self.global_steps:
+                          # update actor
+                          with _timer('update_actor', timing_raw):
+                              if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                                  batch, metrics = self._create_loss_mask(batch, metrics)
+                              # plan single-step path: fixed loss denominator N_orig * L_const
+                              batch.meta_info['loss_len_const'] = float(
+                                  self.config.actor_rollout_ref.actor.plan_loss_len)
+                              actor_output = self.actor_rollout_wg.update_actor(batch)
+                          actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                          metrics.update(actor_output_metrics)
 
                 # plan budget: only the step counts; validation and checkpointing are timed outside it
                 budget.add_step(timing_raw['step'])
                 metrics['plan/budget_gpu_h'] = budget.used_gpu_h
 
                 # validate
+                val_ran = False
                 if self.val_reward_fn is not None and (budget.eval_due() or (
                         self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0)):
                     with _timer('testing', timing_raw):
                         val_metrics: dict = self._validate(dump_tag=f'gpuh{budget.used_gpu_h:.2f}')
                     metrics.update(val_metrics)
+                    val_ran = True
 
-                if self.config.trainer.save_freq > 0 and \
-                        self.global_steps % self.config.trainer.save_freq == 0:
+                done = self.global_steps + 1 >= self.total_training_steps or budget.exhausted()
+                save_due, mark_keep = self._plan_save_due(budget) if self.plan_enabled else (False, False)
+                if done and self.plan_enabled and self.config.trainer.get('plan_save_final', False):
+                    save_due = True
+                if save_due or (self.config.trainer.save_freq > 0 and
+                                self.global_steps % self.config.trainer.save_freq == 0):
                     with _timer('save_checkpoint', timing_raw):
                         self._save_checkpoint(epoch, batch_idx)
+                        if self.plan_enabled:
+                            self._plan_after_save(epoch, batch_idx, mark_keep)
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if not self.plan_enabled:
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._plan_log_jsonl(metrics)
 
                 self.global_steps += 1
 
-                if self.global_steps >= self.total_training_steps or budget.exhausted():
-
-                    # perform validation after training
-                    if self.val_reward_fn is not None:
+                if done:
+                    # perform validation after training, unless this step's eval already scored the last state
+                    if self.val_reward_fn is not None and not val_ran:
                         val_metrics = self._validate(dump_tag=f'final_gpuh{budget.used_gpu_h:.2f}')
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
+                        self._plan_log_jsonl({**val_metrics, 'plan/budget_gpu_h': budget.used_gpu_h})
                     return
-    
+
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""
         response_length = batch.batch['responses'].shape[-1]

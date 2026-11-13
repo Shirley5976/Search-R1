@@ -590,6 +590,17 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def plan_reseed(self, seed):
+        """Plan: per-run seed for python/numpy/torch/CUDA RNGs on every rank. vLLM in the hybrid
+        engine samples from the torch CUDA generator, so this also fixes the rollout stream."""
+        s = int(seed) * 1000 + int(self.rank)
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+        torch.cuda.manual_seed(s)
+        return s
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, checkpoint_path, global_step):
         """Restore actor optimizer, scheduler, and RNG after model initialization."""
         assert self._is_actor

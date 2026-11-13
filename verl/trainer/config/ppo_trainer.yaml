@@ -178,8 +178,29 @@ trainer:
   eval_every_gpu_h: -1  # plan: eval val_files every X GPU hours of step time (-1 = off)
   budget_gpu_h: null  # plan: stop when step-time GPU hours reach this budget
   plan_eval_dir: null  # plan: if set, write per-question eval scores (jsonl) here
+  seed: null  # plan: run seed (worker RNGs = seed*1000+rank, data order = 10000+seed, k* stream)
+  plan_init_path: null  # plan: start a fresh run from this actor checkpoint (weights + optimizer), e.g. theta_w
+  save_every_gpu_h: -1  # plan: checkpoint every X GPU hours of step time (-1 = off)
+  save_keep_gpu_h: null  # plan: list of GPU-hour marks whose checkpoint is never pruned, e.g. [80]
+  save_keep_latest_only: True  # plan: after a plan save, delete older unmarked global_step_* dirs
+  plan_save_final: False  # plan: also save when the budget or the step limit ends the run
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 
 max_turns: 10
 do_search: true
+
+plan:
+  enable: False
+  method: p0  # p0 | p1 | p2_all | p2_sel | p3
+  mode: train  # train | pilot (R012a dump, no update)
+  M: 0  # P3 siblings per fork (pilot: 4)
+  beta: 0.0  # beta_hat from the pilot (prereg/)
+  alpha: 0.0  # P1 shaping scale
+  reader_target: main  # main | negctrl
+  negctrl_map: data/prereg/negctrl_map.json
+  pilot_dump_dir: null
+  reader:
+    path: Qwen/Qwen2.5-7B-Instruct
+    micro_batch_size: 8
+    param_offload: True
