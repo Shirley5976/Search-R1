@@ -261,10 +261,17 @@ class ActorRolloutRefWorker(Worker):
         else:
             sharding_strategy = ShardingStrategy.FULL_SHARD
 
+        # plan R004: 1-GPU reference run of B0b keeps the fp32 master weights and grads on CPU
+        cpu_offload = None
+        if fsdp_config.get('cpu_offload', False):
+            from torch.distributed.fsdp import CPUOffload
+            cpu_offload = CPUOffload(offload_params=True)
+
         # TODO: add transformer policy
         actor_module_fsdp = FSDP(
             actor_module,
             param_init_fn=init_fn,
+            cpu_offload=cpu_offload,
             use_orig_params=False,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),

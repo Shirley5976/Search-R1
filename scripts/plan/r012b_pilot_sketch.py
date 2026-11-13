@@ -18,7 +18,7 @@ vectors, so r014_check.py can compare exact and sketched traces.
 
 --b0b_method p0|p2_all|p3 --b0b_beta B --b0b_M M (B0b formula path): instead of the R014
 aggregates, accumulate the exact restricted training gradient of the whole dump (formula.training_coef),
-partial per rank (OUT/b0b_exact_rank<r>.pt); the full-parameter sketch is combined offline from the
+partial per rank (OUT/b0b_exact_<method>_b<beta>_m<M>_rank<r>.pt); the full-parameter sketch is combined offline from the
 per-vector sketches by r004_compare.py.
 """
 
@@ -235,7 +235,8 @@ def main():
         print(f'[rank {rank}] {out["qid"]} ({out["split"]}): {len(index)} vectors, {out["seconds"]:.1f}s')
 
     if b0b:
-        torch.save({n: v.cpu() for n, v in b0b_acc.items()}, os.path.join(a.out_dir, f'b0b_exact_rank{rank}.pt'))
+        tag = f'{a.b0b_method}_b{a.b0b_beta:g}_m{a.b0b_M}'
+        torch.save({n: v.cpu() for n, v in b0b_acc.items()}, os.path.join(a.out_dir, f'b0b_exact_{tag}_rank{rank}.pt'))
         print(f'[rank {rank}] saved partial exact training gradient on {len(b0b_acc)} tensors')
 
 

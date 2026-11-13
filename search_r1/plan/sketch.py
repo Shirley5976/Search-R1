@@ -134,5 +134,34 @@ def fsdp_local_grad_segments(fsdp_root, names=None):
             yield name, info.intra_param_start_idx, g[info.offset_in_shard:info.offset_in_shard + info.numel_in_shard]
 
 
+def fsdp_full_grads(fsdp_root, names):
+    """Full fp32 gradients {canonical name: tensor} of the listed parameters, assembled from the
+    local flat-parameter shards and all-reduced (every rank gets the full tensors)."""
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    names = set(names)
+    shapes = {}
+    prefixes = {id(m): n for n, m in fsdp_root.named_modules()}
+    for m in FSDP.fsdp_modules(fsdp_root):
+        if m._handle is None:
+            continue
+        flat = m._handle.flat_param
+        prefix = prefixes[id(m)]
+        prefix = (prefix + '.') if prefix else ''
+        for fqn, shape in zip(flat._fqns, flat._shapes):
+            n = clean_name(prefix + fqn)
+            if n in names:
+                shapes[n] = tuple(shape)
+    dev = torch.cuda.current_device()
+    out = {n: torch.zeros(int(np.prod(s)), dtype=torch.float32, device=dev) for n, s in sorted(shapes.items())}
+    for name, start, seg in fsdp_local_grad_segments(fsdp_root, names):
+        out[name][start:start + seg.numel()] += seg.to(dev, torch.float32)
+    for n in out:
+        if dist.is_initialized():
+            dist.all_reduce(out[n])
+        out[n] = out[n].view(shapes[n]).cpu()
+    return out
+
+
 def rel_l2(x, y):
     return float((x - y).norm() / y.norm().clamp_min(1e-30))
