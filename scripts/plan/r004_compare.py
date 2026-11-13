@@ -6,7 +6,8 @@ For every spec tag found as impl_<tag>_ws<w>.pt under --impl_dir:
                 (r012b --b0b_method/--b0b_beta/--b0b_M, if present)
 The implementation computes grad(loss); the formula path stores g = -grad(loss), so the impl side is
 negated. Pass: relative L2 <= --tol (1e-2) on both, and for every beta != 0 spec the formula moves
-away from P0 by more than 5x the error (beta = 0 vs beta != 0 separation). Also checks ws1 vs ws4.
+away from P0 by more than 5x the error (beta = 0 vs beta != 0 separation). Also checks ws1 vs ws4
+(<= tol); with both runs present, an error <= 3x that 1-vs-4-GPU noise floor also passes (bf16).
 """
 
 import argparse
@@ -78,17 +79,26 @@ def main():
                 r[f'ws{ws}']['exact_tensors'] = len(names)
                 passed &= ee <= a.tol
             r[f'ws{ws}']['pass'] = bool(passed)
-            ok &= passed
         if len(impl[tag]) > 1:
             runs = [impl[tag][w] for w in sorted(impl[tag])]
-            r['ws_consistency_rel_l2'] = rel_l2(runs[-1]['sketch'].double(), runs[0]['sketch'].double())
-            ok &= r['ws_consistency_rel_l2'] <= a.tol
+            noise = rel_l2(runs[-1]['sketch'].double(), runs[0]['sketch'].double())
+            r['ws_consistency_rel_l2'] = noise
+            # bf16 fallback (prereg/decisions.md): an error within 3x the implementation's own
+            # 1-GPU vs 4-GPU noise also passes, provided the beta separation check below holds
+            for k, v in r.items():
+                if k.startswith('ws') and isinstance(v, dict) and not v['pass']:
+                    errs = [v['sketch_rel_l2']] + ([v['exact_rel_l2']] if 'exact_rel_l2' in v else [])
+                    v['pass_noise_floor'] = bool(max(errs) <= 3 * noise and abs(v['n_orig_impl'] - n_orig) < 0.5)
+            ok &= noise <= a.tol
         if beta != 0 and p0_formula is not None:
             sep = rel_l2(fs.double(), p0_formula.double())
             worst = max(v['sketch_rel_l2'] for k, v in r.items() if k.startswith('ws') and isinstance(v, dict))
             r['separation_from_p0'] = sep
             r['separation_ok'] = bool(sep > 5 * worst)
             ok &= r['separation_ok']
+        for k, v in r.items():
+            if k.startswith('ws') and isinstance(v, dict):
+                ok &= v['pass'] or v.get('pass_noise_floor', False)
         report[tag] = r
         print(tag, json.dumps(r))
     report['pass'] = bool(ok)
