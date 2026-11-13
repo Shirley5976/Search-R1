@@ -97,20 +97,26 @@ def main():
 
     captured = {}
 
+    def exact_names(module):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        prefix_of = {id(x): n for n, x in module.named_modules()}
+        want = set()
+        for m in FSDP.fsdp_modules(module):
+            if m._handle is not None:
+                pre = prefix_of[id(m)]
+                pre = (pre + '.') if pre else ''
+                for fqn in m._handle.flat_param._fqns:
+                    n = clean_name(pre + fqn)
+                    if any(n.startswith(p) for p in a.exact_prefix):
+                        want.add(n)
+        return sorted(want)
+
+    names = exact_names(actor.actor_module) if a.exact_prefix else []
+
     def hook(module):
         captured['sketch'] = fsdp_grad_sketch(module, a.D, a.sketch_seed).cpu()
-        if a.exact_prefix:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            want = set()
-            for m in FSDP.fsdp_modules(module):
-                if m._handle is not None:
-                    pre = [n for n, x in module.named_modules() if x is m][0]
-                    pre = (pre + '.') if pre else ''
-                    for fqn in m._handle.flat_param._fqns:
-                        n = clean_name(pre + fqn)
-                        if any(n.startswith(p) for p in a.exact_prefix):
-                            want.add(n)
-            captured['exact'] = fsdp_full_grads(module, sorted(want))
+        if names:
+            captured['exact'] = fsdp_full_grads(module, names)
 
     actor.pre_step_hook = hook
     batches = b0b.load_dump(a.dump_dir)

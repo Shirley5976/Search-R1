@@ -125,6 +125,10 @@ def main_task(config):
         with open_dict(config):
             config.actor_rollout_ref.model.resume_path = resume_checkpoint
             config.trainer.resume_from_path = resume_checkpoint
+    elif config.trainer.get('plan_init_path', None):
+        # plan: actor weights from theta_w (the optimizer state is loaded later by fit); ref keeps model.path
+        with open_dict(config):
+            config.actor_rollout_ref.model.resume_path = str(config.trainer.plan_init_path)
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)

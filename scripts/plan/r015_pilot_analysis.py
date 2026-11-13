@@ -251,9 +251,14 @@ def main():
     ap.add_argument('--out_prefix', default=os.path.join(ROOT, 'prereg', 'pilot_result'))
     ap.add_argument('--n_boot', type=int, default=2000)
     ap.add_argument('--device', default='cpu')
+    ap.add_argument('--split_by_half', action='store_true',
+                    help='R050: ignore the stored split, alternate questions between calib and eval (diagnostic)')
     a = ap.parse_args()
-    costs = json.load(open(a.costs))
+    costs = {k: v for k, v in json.load(open(a.costs)).items() if not k.startswith('_')}  # drop '_ledger'
     meta, vecs, bars, _ = load(a.sketch_dir, device=a.device)
+    if a.split_by_half:
+        for i, m in enumerate(meta):
+            m['split'] = 'pilot_calib' if i % 2 == 0 else 'pilot_eval'
     res0 = analyse(meta, vecs, costs, n_boot=200, seed=0)
     dec = decomposition_vecs(meta, a.sketch_dir, res0['p3_M_star'], device=a.device)
     res = analyse(meta, vecs, costs, n_boot=a.n_boot, seed=0, decomp_vecs=dec)

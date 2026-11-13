@@ -871,6 +871,11 @@ class RayPPOTrainer(PlanTrainerMixin):
 
         logger = self.logger
         if self.plan_enabled and self.plan_mode == 'pilot':
+            init_from = self.config.trainer.get('plan_init_path', None)
+            if init_from:
+                # pilot / W drift: rollouts from theta_w (or a later checkpoint), ref stays the base model
+                self.actor_rollout_wg.load_checkpoint(init_from, 0)
+                print(f'[plan] pilot policy loaded from {init_from}')
             self._plan_reseed_workers()
             generation_manager = LLMGenerationManager(tokenizer=self.tokenizer, actor_rollout_wg=self.actor_rollout_wg,
                                                       config=self._make_gen_config())
